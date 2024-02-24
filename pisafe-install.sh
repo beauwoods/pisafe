@@ -11,13 +11,79 @@
 ####################
 # Exit when any command fails, printing a message to STDOUT when doing so.
 set -e # Set the script to exit on any failures, to avoid partial installs or clobbering exiting configs
+script_exit_normal=false # Set a flag to clarify that the script exited abnormally, until resetting it to true just before the script ends.
 trap 'last_command=$current_command; current_command=$BASH_COMMAND' DEBUG # Keep track of the last executed command
-trap 'echo "XXXXXXXXXXFailure when running \"${last_command}\" with exit code $?."' EXIT # On script exit, echo an error message
+trap 'if [[ $script_exit_normal != true ]]; then echo "XXXXXXXXXXFailure when running \"${last_command}\" with exit code $?."; fi' EXIT # On script exit, echo an error message
 
 ## Establish the preliminary variables
 script_name="pisafe" # What are we calling this script?
 script_file_name="$script_name-install.sh" # What do we expect the filename to be?
 output_log="$HOME/$script_name.log" # Create a log file for status updates and errors
+
+# Check if we can execute commands with sudo without a password
+if ! sudo -ln &> /dev/null; then
+    echo "This script requires sudo access to run. Please ensure you have sudo privileges."
+    exit 1
+fi
+
+if ! command -v curl &> /dev/null; then
+    echo "Error: curl is required but it's not installed. Please install curl and try again."
+    exit 1
+fi
+
+##########
+## Functions
+##########
+
+## find_window_manager() - Determine which window manager to use. Keep this above the function call
+## Source: https://unix.stackexchange.com/questions/64627/whiptail-or-dialog
+find_window_manager() {
+    read window <<< "$(which whiptail dialog 2> /dev/null)" # Check whether whiptail or dialog is installed, assign the first one found to '$window'
+    [[ "$window" ]] || {
+    echo 'Error: Neither whiptail nor dialog found' >&2 # If neither whiptail or dialog is installed, throw an error.
+    exit 1
+    }
+} # End find_window_manager()
+
+## configure_ssh() - Gather configuration details for harening the ssh server
+configure_ssh() {
+    $window --msgbox --title "SSH information gathering" "The SSH service allows for remote administration in a highly secureable manner. This script will collect information and make the configuration changes necessary to: \
+        \n  1. Enable certificate-based authentication \
+        \n  2. Disable password-based authentication \
+        \n  3. Change the SSH port" 25 80 
+
+    ## First, set 'ssh_key' to a non-null, invalid key value. Then while it's not valid and not null, iterate over this dialog until it's entered correctly. We first initialize the 'ssh_key' variable, then show the dialog until EITHER the variable is NULL (input is blank, indicating a desire to avoid doing anything) or we receive a valid SSH public key, as verified by ssh-keygen.
+    ssh_key="variable initialization" # Set this to a STRING that is not a valid SSH key
+    valid_ssh_key="1" # Set this to 1, which is neither the status code for 'valid' nor 'invalid/failure' we set later
+    until [ -z "$ssh_key" ] || [ "$valid_ssh_key" -eq 0 ]
+    do
+        ssh_key=$($window --inputbox "SSH keys are access credentials based on strong cryptographic principles. You can learn more about them here: https://www.ssh.com/academy/ssh-keys \
+        \n \
+        \nEntering your SSH public key below will add the key to the 'authorized_keys' file. Leave the field blank to avoid changing this setting. \
+        \n" --title "Gathering SSH key" 25 80 3>&1 1>&2 2>&3)
+        ssh_key=$(echo "$ssh_key" | tr -d '\n') # Remove newline charachter ('\n') from the key, if it has any
+        #if [ -n "$ssh_key" ]; then break; fi # If the response is NULL, '$ssh_key' is NULL and the while loop breaks
+        echo "$ssh_key" | ssh-keygen -lf - 2>&1 1>&/dev/null # Test to see if the SSH key is valid
+        valid_ssh_key=$? # Store the exit status of the test as a variable 'valid_ssh_key' - 0 indicates a valid key, 255 indicates some kind of failure
+        if [ "$valid_ssh_key" -eq 255 ] && [ ! -z "$ssh_key" ]; then
+            $window --msgbox "You entered an invalid SSH public key. You will be prompted again. To skip this step, leave the field blank." --title "Invalid SSH key" 25 80 # If the SSH key is invalid
+        elif [ "$valid_ssh_key" -eq 0 ]; then
+            ssh_key_name=$($window --inputbox "Enter a name for the SSH key \
+            \n" --title "Gathering SSH key name" 25 80 3>&1 1>&2 2>&3) # Get a name for the SSH key to be written to the 'authrized_keys' file
+            $window --title "Disable SSH password authentication" --yesno "SSH key authentication is (typically) much stronger than password authentication, which is enabled by default. Would you like to disable password authentication?" 25 80 --no-button "No change" --yes-button "Disable password authentication" # Prompt to disable password authentication in the '/etc/ssh/sshd_config.d/' file that we write later
+            disable_ssh_password_authentication=$? # Set the variable to the desired choice. Yes=1; No=0
+        fi
+    done
+
+# Create a dialog box to prompt for the SSH port. If the port is invalid (not between 1-65535) then show an error message and prompt again. If the port is valid, then set the variable 'ssh_port' to the value entered. If the port is NULL, then set the variable 'ssh_port' to the default value of 22.
+    ssh_port="0" # Set this to an invalid SSH port so the loop below will trigger
+    until [ "$ssh_port" -ge 1 ] && [ "$ssh_port" -le 65535 ] || [ -z "$ssh_port" ] 
+    do
+        ssh_port=$($window --inputbox "Enter the port you want to use for SSH. The default port is 22. \
+        \n" --title "Gathering SSH port" 25 80 3>&1 1>&2 2>&3)
+    done
+
+} # End configure_ssh()
 
 ## Set up the logfile and dump some information into it to get us started
 printf "==========Output from the \"%s\" script, run as %s on %s\n" "$script_name" "$last_command" "$(date)" > $output_log # Start the logfile, overwriting any file that existed before
@@ -60,14 +126,14 @@ printf "==========Exited PASSWORD CHANGE at %s\n" "$(date)" >> "$output_log"
 ## 2a. Import SSH key - Test if the '.ssh' folder exists in the account root and, if not, create it, backup the existing 'authorized_keys' file, then place the key into the 'authorized_keys' file, with a comment on source and date.
 
 printf "\n.....\nWorking: 2a. Import SSH key\n"
-if test ! -d ~/.ssh # If the .ssh folder doesn't exist,
-then 
+if [ ! -d ~/.ssh ]; then # If the .ssh folder doesn't exist,
     mkdir ~/.ssh # Create it
-elif ~/.ssh/authorized_keys # If the authorized_keys file exists,
-then
+fi
+if [ -f ~/.ssh/authorized_keys ]; then # If the authorized_keys file exists,
     cp ~/.ssh/authorized_keys ~/.ssh/authorized_keys.$script_name.backup # Backup the existing authorized_keys file
 fi
-printf "\n\n# %s, added %s \n%s\n\n" "$(date)" "$ssh_key_name" "$ssh_key" >> ~/.ssh/authorized_keys # Add the key to the authorized_keys file
+# Then proceed to add the key to the authorized_keys file
+printf "\n\n# %s, added %s \n%s\n\n" "$(date)" "$ssh_key_name" "$ssh_key" >> ~/.ssh/authorized_keys
 printf "Completed: 2a. Import SSH key\n.....\n"
 
 ##
@@ -126,7 +192,7 @@ printf "\n.....\nCompleted: 2b. Install unattended-upgrades\n"
 
 
 
-## Send exit message to the console
+
 printf "\nAlright, we're done here! Did we have fun today? That's good.\n"
 printf "I've cleaned up what I can here, but you may have to do some on your own.\n" 
 printf " - Restart sshd (this will boot you from any current sshd sessions).\n"
@@ -158,56 +224,7 @@ while true; do
 done
 
 
-##########
-## Functions
-##########
 
-## find_window_manager() - Determine which window manager to use
-## Source: https://unix.stackexchange.com/questions/64627/whiptail-or-dialog
-find_window_manager() {
-    read window <<< "$(which whiptail dialog 2> /dev/null)" # Check whether whiptail or dialog is installed, assign the first one found to '$window'
-    [[ "$window" ]] || {
-    echo 'Error: Neither whiptail nor dialog found' >&2 # If neither whiptail or dialog is installed, throw an error.
-    exit 1
-    }
-} # End find_window_manager()
 
-## configure_ssh() - Gather configuration details for harening the ssh server
-configure_ssh() {
-    $window --msgbox --title "SSH information gathering" "The SSH service allows for remote administration in a highly secureable manner. This script will collect information and make the configuration changes necessary to: \
-        \n  1. Enable certificate-based authentication \
-        \n  2. Disable password-based authentication \
-        \n  3. Change the SSH port" 25 80 
-
-    ## First, set 'ssh_key' to a non-null, invalid key value. Then while it's not valid and not null, iterate over this dialog until it's entered correctly. We first initialize the 'ssh_key' variable, then show the dialog until EITHER the variable is NULL (input is blank, indicating a desire to avoid doing anything) or we receive a valid SSH public key, as verified by ssh-keygen.
-    ssh_key="variable initialization" # Set this to a STRING that is not a valid SSH key
-    valid_ssh_key="1" # Set this to 1, which is neither the status code for 'valid' nor 'invalid/failure' we set later
-    until [ -z "$ssh_key" ] || [ "$valid_ssh_key" -eq 0 ]
-    do
-        ssh_key=$($window --inputbox "SSH keys are access credentials based on strong cryptographic principles. You can learn more about them here: https://www.ssh.com/academy/ssh-keys \
-        \n \
-        \nEntering your SSH public key below will add the key to the 'authorized_keys' file. Leave the field blank to avoid changing this setting. \
-        \n" --title "Gathering SSH key" 25 80 3>&1 1>&2 2>&3)
-        ssh_key=$(echo "$ssh_key" | tr -d '\n') # Remove newline charachter ('\n') from the key, if it has any
-        #if [ -n "$ssh_key" ]; then break; fi # If the response is NULL, '$ssh_key' is NULL and the while loop breaks
-        echo "$ssh_key" | ssh-keygen -lf - 2>&1 1>&/dev/null # Test to see if the SSH key is valid
-        valid_ssh_key=$? # Store the exit status of the test as a variable 'valid_ssh_key' - 0 indicates a valid key, 255 indicates some kind of failure
-        if [ "$valid_ssh_key" -eq 255 ] && [ ! -z "$ssh_key" ]; then
-            $window --msgbox "You entered an invalid SSH public key. You will be prompted again. To skip this step, leave the field blank." --title "Invalid SSH key" 25 80 # If the SSH key is invalid
-        elif [ "$valid_ssh_key" -eq 0 ]; then
-            ssh_key_name=$($window --inputbox "Enter a name for the SSH key \
-            \n" --title "Gathering SSH key name" 25 80 3>&1 1>&2 2>&3) # Get a name for the SSH key to be written to the 'authrized_keys' file
-            $window --title "Disable SSH password authentication" --yesno "SSH key authentication is (typically) much stronger than password authentication, which is enabled by default. Would you like to disable password authentication?" 25 80 --no-button "No change" --yes-button "Disable password authentication" # Prompt to disable password authentication in the '/etc/ssh/sshd_config.d/' file that we write later
-            disable_ssh_password_authentication=$? # Set the variable to the desired choice. Yes=1; No=0
-        fi
-    done
-
-# Create a dialog box to prompt for the SSH port. If the port is invalid (not between 1-65535) then show an error message and prompt again. If the port is valid, then set the variable 'ssh_port' to the value entered. If the port is NULL, then set the variable 'ssh_port' to the default value of 22.
-    ssh_port="0" # Set this to an invalid SSH port so the loop below will trigger
-    until [ "$ssh_port" -ge 1 ] && [ "$ssh_port" -le 65535 ] || [ -z "$ssh_port" ] 
-    do
-        ssh_port=$($window --inputbox "Enter the port you want to use for SSH. The default port is 22. \
-        \n" --title "Gathering SSH port" 25 80 3>&1 1>&2 2>&3)
-    done
-
-} # End configure_ssh()
+## Send exit message to the console
+script_exit_normal=true # Set the flag to indicate that the script exited normally
